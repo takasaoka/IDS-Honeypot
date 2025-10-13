@@ -9,15 +9,18 @@ import time
 LOG_DIR = Path("honeypot_logs")
 LOG_DIR.mkdir(exist_ok=True)
 
-
+"""
+This is a Honeypot class which includes the handling of the connection while logging the data.
+"""
 class HoneyPot:
+    # Constructor / Initialization of the honeypot
     def __init__(self, bind_ip="0.0.0.0", ports=None):
         self.bind_ip = bind_ip
         self.ports = ports or [21, 22, 80, 443]
         self.active_connections = {}
         self.log_file = LOG_DIR / f"honeypot_{datetime.datetime.now().strftime('%Y%m%d')}.json"
 
-
+    # Logs the data to file
     def log(self, port, remote_ip, data: bytes):
         activity = {
             "timestamp": datetime.datetime.now().isoformat(),
@@ -30,7 +33,7 @@ class HoneyPot:
             json.dump(activity, f)
             f.write('\n')
 
-    
+    # Handles the connection
     def handle_connection(self, client_socket: socket.socket, remote_ip, port):
         service_banners = {
             21: "220 FTP server ready\r\n",
@@ -57,7 +60,7 @@ class HoneyPot:
         finally:
             client_socket.close()
 
-        
+    # Socket listen function, just standard socket functions
     def listen(self, port):
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -76,8 +79,11 @@ class HoneyPot:
             print(f"error starting listener on port {port}: {e}")
 
 
-
+# Main function
 def main():
+    flag = Path("honeypot_enabled")
+    while not flag.exists():
+        time.sleep(0.5)
     honeypot = HoneyPot()
     for port in honeypot.ports:
         listener_thread = threading.Thread(

