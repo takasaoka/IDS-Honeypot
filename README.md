@@ -10,6 +10,9 @@ pip install numpy scikit-learn scapy
 ## open the port (linux specific)
 ```
 sudo ufw allow 8080/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 21/tcp
+sudo ufw allow 22/tcp
 ```
 ## Terminal 1 (Machine 1): start the honeypot
 ```
