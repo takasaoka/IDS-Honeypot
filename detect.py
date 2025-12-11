@@ -19,6 +19,17 @@ Anomaly based detction using isolation forest, mainly just setup for testing pur
 
 WINDOW = 10
 THRESHOLD = 10
+ALERTS_FILE = Path("alerts.log")
+
+
+def log_alert(alert_type, message):
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    try:
+        with ALERTS_FILE.open("a") as f:
+            f.write(json.dumps({"timestamp": ts, "type": alert_type, "message": message}) + "\n")
+    except Exception:
+        pass
+
 
 def read(path: Path):
     if path.is_file():
@@ -98,7 +109,7 @@ def _features_baseline(line, now, prev_timestamp, recent):
         rate = len(recent) / WINDOW
     else:
         rate = 0.0
-    port = 0.0
+    port = 8080.0
     line_length = float(len(line))
     return [line_length, float(timestamp), randomness, printable, rate, port]
 
@@ -220,6 +231,7 @@ def main():
                 ts = datetime.datetime.now().isoformat(timespec="seconds")
                 print(f"timestamp: {ts} {len(recent)} events in last {WINDOW} seconds")
                 Path("honeypot_enabled").touch(exist_ok=True)
+                log_alert("baseline_dos", f"{len(recent)} events in last {WINDOW} seconds")
                 signature_triggered = True
 
             # For anomaly detection
@@ -240,6 +252,7 @@ def main():
                         ts = datetime.datetime.now().isoformat(timespec="seconds")
                         print(f"timestamp: {ts} anomaly detected len={int(features[0])} dt={features[1]:.3f}")
                         Path("honeypot_enabled").touch(exist_ok=True)
+                        log_alert("baseline_anomaly", f"anomaly detected len={int(features[0])} dt={features[1]:.3f}")
                         signature_triggered = True
 
             if signature_triggered:
@@ -278,6 +291,7 @@ def main():
                     ts = datetime.datetime.now().isoformat(timespec="seconds")
                     print(f"timestamp: {ts} {len(recent)} events in last {WINDOW} seconds")
                     Path("honeypot_enabled").touch(exist_ok=True)
+                    log_alert("honeypot_dos", f"{len(recent)} events in last {WINDOW} seconds")
 
                 if args.isoforest:
                     obj = None
@@ -299,6 +313,7 @@ def main():
                             ts = datetime.datetime.now().isoformat(timespec="seconds")
                             print(f"timestamp: {ts} anomaly detected len={int(features[0])} dt={features[1]:.3f}")
                             Path("honeypot_enabled").touch(exist_ok=True)
+                            log_alert("honeypot_anomaly", f"anomaly detected len={int(features[0])} dt={features[1]:.3f}")
 
                         
                     else:
