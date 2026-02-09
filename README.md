@@ -19,7 +19,19 @@ sudo ufw allow 22/tcp
 sudo python3 honeypot.py
 ```
 
+## Terminal 1 (Machine 1): Get IP
+```
+hostname -I
+```
+
 The honeypot will listen on ports 21, 22, 80 and 443 but will not activate until the trigger by the detect.py is set off
+```
+source .venv/bin/activate
+sudo systemctl start ollama
+systemctl is-active ollama
+python3 dashboard.py or sudo env "PATH=$PATH" python dashboard.py
+```
+
 
 ## Terminal 2 (Machine 1): start detector
 ```
@@ -41,3 +53,19 @@ python3 dos.py --target <target IP Address> --ports 21,22,80,443 --requestsPerSe
 ```
 
 All logs will be collected into the honeypot_logs folder in the current directory
+
+# MACHINE 3 - LLM
+## Set Firewall rule to allow inbound on port 5555 (Start powershell as admin)
+```
+New-NetFirewallRule -DisplayName "LLM TCP 5555" -Direction Inbound -Protocol TCP -LocalPort 5555 -Action Allow
+```
+
+## Start ollama
+```
+ollama serve
+```
+
+## Start llm.py
+```
+python llm.py --host 0.0.0.0 --port 5555 --model qwen2.5:3b --timeout 60
+```

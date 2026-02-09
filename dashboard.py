@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 import sys
 import json
+from collections import deque
 
 """
 This is the frontend dashboard for the app using NiceGUI.
@@ -16,6 +17,13 @@ BASELINE_DIR = Path('baseline_logs')
 
 detect_process = None
 honeypot_process = None
+detect_log_handle = None
+honeypot_log_handle = None
+
+LLM_HOST = '192.168.1.71'
+LLM_PORT = '5555'
+LLM_MODEL = 'qwen2.5:3b'
+LLM_TIMEOUT = '60'
 
 
 # Loads the honeypot logs
@@ -33,7 +41,8 @@ def load_honeypot_logs():
 
     try:
         with latest.open('r') as f:
-            for line in f:
+            dq = deque(f, maxlen=500)
+            for line in dq:
                 line = line.strip()
                 if not line:
                     continue
@@ -86,7 +95,8 @@ def load_alert_logs():
         return rows
     try:
         with p.open('r') as f:
-            for line in f:
+            dq = deque(f, maxlen=500)
+            for line in dq:
 
                 line = line.strip()
 
@@ -110,20 +120,65 @@ def load_alert_logs():
     return rows
 
 
+def load_llm_logs():
+    rows = []
+
+    p = Path('llm_alerts.log')
+    if not p.exists():
+        return rows
+    try:
+        with p.open('r') as f:
+            dq = deque(f, maxlen=500)
+            for line in dq:
+
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    obj = json.loads(line)
+                    llm = obj.get('llm', {})
+                    rows.append({
+                        'timestamp': obj.get('timestamp', obj.get('ts', '')),
+                        'type': obj.get('type', ''),
+                        'label': llm.get('label', ''),
+                        'confidence': llm.get('confidence', ''),
+                        'summary': llm.get('summary', ''),
+                        'view': '',
+                    })
+                except Exception:
+                    rows.append({
+                        'timestamp': '',
+                        'type': '',
+                        'label': '',
+                        'confidence': '',
+                        'summary': line,
+                        'view': '',
+                    })
+    except Exception:
+        pass
+
+    rows.reverse()
+    return rows
+
+
 
 
 # starts IDS
 def start_ids():
     global detect_process
+    global detect_log_handle
 
     if detect_process is not None and detect_process.poll() is None:
         return
     
     try:
+        detect_log_handle = Path('detect_process.log').open('a', buffering=1)
         detect_process = subprocess.Popen(
-            [sys.executable, '-u', 'detect.py', '--isoforest', '--baseline', '1000', '--contamination', '0.015'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            [sys.executable, '-u', 'detect.py', '--net', '--isoforest', '--baseline', '1000', '--contamination', '0.015', '--llm', '--llm-host', LLM_HOST, '--llm-port', LLM_PORT, '--llm-model', LLM_MODEL, '--llm-timeout', LLM_TIMEOUT],
+            stdout=detect_log_handle,
+            stderr=subprocess.STDOUT,
         )
     except Exception:
         detect_status.set_text('error startting IDS')
@@ -132,14 +187,16 @@ def start_ids():
 # starts honeypot
 def start_honeypot():
     global honeypot_process
+    global honeypot_log_handle
     if honeypot_process is not None and honeypot_process.poll() is None:
         return
     
     try:
+        honeypot_log_handle = Path('honeypot_process.log').open('a', buffering=1)
         honeypot_process = subprocess.Popen(
             [sys.executable, '-u', 'honeypot.py'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=honeypot_log_handle,
+            stderr=subprocess.STDOUT,
         )
     except Exception:
         honeypot_status.set_text('error starting honeypot')
@@ -149,6 +206,7 @@ def start_honeypot():
 # stops detection
 def stop_ids():
     global detect_process
+    global detect_log_handle
     if detect_process is None:
         return
     try:
@@ -161,6 +219,12 @@ def stop_ids():
     except Exception:
         pass
     detect_process = None
+    try:
+        if detect_log_handle:
+            detect_log_handle.close()
+    except Exception:
+        pass
+    detect_log_handle = None
 
 
 
@@ -168,6 +232,7 @@ def stop_ids():
 # stops the honepot
 def stop_honeypot():
     global honeypot_process
+    global honeypot_log_handle
     if honeypot_process is None:
         return
     
@@ -183,6 +248,12 @@ def stop_honeypot():
         pass
 
     honeypot_process = None
+    try:
+        if honeypot_log_handle:
+            honeypot_log_handle.close()
+    except Exception:
+        pass
+    honeypot_log_handle = None
 
 
 # updates status of the different processes
@@ -238,6 +309,33 @@ alert_columns = [
     {'name': 'message', 'label': 'Message', 'field': 'message', 'sortable': False},
 ]
 
+llm_columns = [
+    {'name': 'timestamp', 'label': 'Timestamp', 'field': 'timestamp', 'sortable': True},
+    {'name': 'type', 'label': 'Type', 'field': 'type', 'sortable': True},
+    {'name': 'label', 'label': 'Label', 'field': 'label', 'sortable': True},
+    {'name': 'confidence', 'label': 'Confidence', 'field': 'confidence', 'sortable': True},
+    {'name': 'view', 'label': 'Summary', 'field': 'view', 'sortable': False},
+]
+
+
+
+
+with ui.dialog() as summary_dialog:
+    with ui.card():
+        ui.label('Summary')
+        summary_text = ui.label('')
+        ui.button('Close', on_click=summary_dialog.close)
+
+
+
+def show_summary(e):
+    row = e.args
+    if not isinstance(row, dict):
+        return
+    summary_text.set_text(str(row.get('summary', '')))
+    summary_dialog.open()
+
+
 
 
 with ui.column().classes('w-full'):
@@ -245,6 +343,19 @@ with ui.column().classes('w-full'):
 
     alerts_table = ui.table(columns=alert_columns, rows=load_alert_logs(), pagination=10).classes('w-full')
     ui.button('Refresh alerts', on_click=lambda: alerts_table.update_rows(load_alert_logs()))
+
+
+with ui.column().classes('w-full'):
+    ui.label('LLM logs')
+
+    llm_table = ui.table(columns=llm_columns, rows=load_llm_logs(), pagination=10).classes('w-full')
+    llm_table.add_slot('body-cell-view', '''
+    <q-td :props="props">
+    <q-btn label="View" size="sm" @click="$parent.$emit('show_summary', props.row)" />
+    </q-td>
+    ''')
+    llm_table.on('show_summary', show_summary)
+    ui.button('Refresh LLM logs', on_click=lambda: llm_table.update_rows(load_llm_logs()))
 
 
 with ui.column().classes('w-full'):
@@ -256,6 +367,7 @@ with ui.column().classes('w-full'):
 def refresh():
     update_status()
     alerts_table.update_rows(load_alert_logs())
+    llm_table.update_rows(load_llm_logs())
 
 
 

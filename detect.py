@@ -10,6 +10,8 @@ import json
 import math
 from scipy.stats import entropy
 from collections import Counter
+import socket
+import threading
 
 """
 This file has a combination of signature based detection and anomaly based detection.
@@ -20,8 +22,11 @@ Anomaly based detction using isolation forest, mainly just setup for testing pur
 WINDOW = 10
 THRESHOLD = 10
 ALERTS_FILE = Path("alerts.log")
+LLM_ALERTS_FILE = Path("llm_alerts.log")
 
 
+
+#Logs alert
 def log_alert(alert_type, message):
     ts = datetime.datetime.now().isoformat(timespec="seconds")
     try:
@@ -29,6 +34,99 @@ def log_alert(alert_type, message):
             f.write(json.dumps({"timestamp": ts, "type": alert_type, "message": message}) + "\n")
     except Exception:
         pass
+
+
+# Logs llm response
+def log_llm(alert_type, obj):
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    try:
+        with LLM_ALERTS_FILE.open("a") as f:
+            f.write(json.dumps({"timestamp": ts, "type": alert_type, "llm": obj}) + "\n")
+    except Exception:
+        pass
+
+
+def recv_exact(conn, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+        
+    return buf
+
+
+# Queries the llm running on other machine
+def call_llm_tcp(alert, host, port, model, timeout):
+    req = json.dumps({"alert": alert, "model": model, "timeout": timeout}).encode("utf-8")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        s.sendall(len(req).to_bytes(4, "big") + req)
+        header = recv_exact(s, 4)
+        if not header:
+            return None
+        length = int.from_bytes(header, "big")
+        payload = recv_exact(s, length)
+        if payload is None:
+            return None
+        return json.loads(payload.decode("utf-8", errors="ignore"))
+    
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+
+# Message format for llm
+def baseline_llm_message(lines, now_iso):
+    samples = []
+    for line in lines:
+        if line is None:
+            continue
+        s = str(line)
+        samples.append(s[:200])
+
+    return {
+        "timestamp": now_iso,
+        "source": "baseline",
+        "event_count": len(lines),
+        "samples": samples[:10]
+    }
+
+
+# Message format for llm
+def honeypot_llm_message(objs, now_iso):
+    samples = []
+    ips = []
+    ports = []
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        data = obj.get("data", "")
+        ip = obj.get("remote_ip", "")
+        port = obj.get("port", 0)
+        ips.append(ip)
+        ports.append(port)
+        s = str(data)
+        samples.append(s[:200])
+
+    top_ips = Counter(ips).most_common(5) if ips else []
+    top_ports = Counter(ports).most_common(5) if ports else []
+
+    return {
+        "timestamp": now_iso,
+        "source": "honeypot",
+        "event_count": len(objs),
+        "top_ips": [{"ip": ip, "count": c} for ip, c in top_ips],
+        "top_ports": [{"port": p, "count": c} for p, c in top_ports],
+        "samples": samples[:10]
+    }
+
 
 
 def read(path: Path):
@@ -150,6 +248,49 @@ def _features_honeypot(obj, now, prev_timestamp, recent):
     return [line_length, float(dt), randomness, printable, rate, port], timestamp, data
 
 
+# Starts network capturing
+def start_network_cap(iface, out_path):
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-u", "packetcap.py", "--iface", iface, "--out", out_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+
+
+# Monitors the network
+def network_monitor(out_path, args, stop_event):
+    p = Path(out_path)
+    recent_net_events = deque(maxlen=400)
+
+    while not stop_event.is_set():
+        if not p.exists():
+            time.sleep(0.2)
+            continue
+        break
+
+    try:
+        for line in read(p):
+            if stop_event.is_set():
+                break
+            line = line.strip()
+
+            if not line:
+                continue
+
+            obj = None
+            try:
+                obj = json.loads(line)
+            except Exception:
+                obj = None
+            if not isinstance(obj, dict):
+                continue
+
+            recent_net_events.append(obj)
+    except Exception:
+        pass
 
 
 # Main function
@@ -158,6 +299,14 @@ def main():
     ap.add_argument("--isoforest", action="store_true")
     ap.add_argument("--baseline", type=int, default=5)
     ap.add_argument("--contamination", type=float, default=0.3)
+    ap.add_argument("--llm", action="store_true")
+    ap.add_argument("--llm-host", type=str, default=os.getenv("LLM_HOST","127.0.0.1"))
+    ap.add_argument("--llm-port", type=int, default=int(os.getenv("LLM_PORT","5555")))
+    ap.add_argument("--llm-model", type=str, default=os.getenv("LLM_MODEL","llama3.1:8b"))
+    ap.add_argument("--llm-timeout", type=int, default=int(os.getenv("LLM_TIMEOUT","60")))
+    ap.add_argument("--net", action="store_true")
+    ap.add_argument("--net-iface", type=str, default=os.getenv("NET_IFACE","eth0"))
+    ap.add_argument("--net-out", type=str, default=os.getenv("NET_OUT","network_logs.log"))
     args = ap.parse_args()
 
     logs_dir = Path("honeypot_logs")
@@ -182,17 +331,31 @@ def main():
     baseline_dir.mkdir(exist_ok=True)
     baseline_active_log = baseline_dir / f"baseline_{datetime.datetime.now().strftime('%Y%m%d')}.log"
 
+    recent_baseline_events = deque(maxlen=200)
+    recent_honeypot_events = deque(maxlen=200)
+
+    net_proc = None
+    net_stop = threading.Event()
+    net_thread = None
+    if args.net:
+        net_proc = start_network_cap(args.net_iface, args.net_out)
+        net_thread = threading.Thread(target=network_monitor, args=(args.net_out, args, net_stop))
+        net_thread.daemon = True
+
+        net_thread.start()
+
     if args.isoforest:
         try:
             files = [p for p in baseline_dir.iterdir() if p.is_file() and p.name.startswith("baseline_")]
             files.sort(key=os.path.getmtime)
             previous = None
+            prev = None
             for previous in files:
                 try:
                     with previous.open("r", buffering=1) as f:
                         for line in f:
-                            features = _features_baseline(line, 0.0, previous, [])
-                            previous = 0.0 if previous is None else previous
+                            features = _features_baseline(line, 0.0, prev, [])
+                            prev = 0.0 if prev is None else prev
                             baseline.append(features)
                 except Exception:
                     pass
@@ -218,6 +381,7 @@ def main():
         for line in log_lines2elixir:
             with baseline_active_log.open("a") as baf:
                 baf.write(line)
+            recent_baseline_events.append(line)
             # Signature detection based on specific amount within specified time frame based on the window and threshold above
             now = time.time()
             recent.append(now)
@@ -232,6 +396,15 @@ def main():
                 print(f"timestamp: {ts} {len(recent)} events in last {WINDOW} seconds")
                 Path("honeypot_enabled").touch(exist_ok=True)
                 log_alert("baseline_dos", f"{len(recent)} events in last {WINDOW} seconds")
+                if args.llm:
+                    try:
+                        now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+                        alert = baseline_llm_message(list(recent_baseline_events), now_iso)
+                        obj = call_llm_tcp(alert, args.llm_host, args.llm_port, args.llm_model, args.llm_timeout)
+                        if isinstance(obj, dict) and "error" not in obj:
+                            log_llm("baseline_dos", obj)
+                    except Exception:
+                        pass
                 signature_triggered = True
 
             # For anomaly detection
@@ -253,6 +426,15 @@ def main():
                         print(f"timestamp: {ts} anomaly detected len={int(features[0])} dt={features[1]:.3f}")
                         Path("honeypot_enabled").touch(exist_ok=True)
                         log_alert("baseline_anomaly", f"anomaly detected len={int(features[0])} dt={features[1]:.3f}")
+                        if args.llm:
+                            try:
+                                now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+                                alert = baseline_llm_message(list(recent_baseline_events), now_iso)
+                                obj = call_llm_tcp(alert, args.llm_host, args.llm_port, args.llm_model, args.llm_timeout)
+                                if isinstance(obj, dict) and "error" not in obj:
+                                    log_llm("baseline_anomaly", obj)
+                            except Exception:
+                                pass
                         signature_triggered = True
 
             if signature_triggered:
@@ -281,6 +463,11 @@ def main():
             for line in log_lines2elixir:
                 with active_log.open("a") as active_file:
                     active_file.write(line)
+                try:
+                    obj2 = json.loads(line)
+                    recent_honeypot_events.append(obj2)
+                except Exception:
+                    pass
                 now = time.time()
                 recent.append(now)
                 cutoff = now - WINDOW
@@ -292,6 +479,15 @@ def main():
                     print(f"timestamp: {ts} {len(recent)} events in last {WINDOW} seconds")
                     Path("honeypot_enabled").touch(exist_ok=True)
                     log_alert("honeypot_dos", f"{len(recent)} events in last {WINDOW} seconds")
+                    if args.llm:
+                        try:
+                            now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+                            alert = honeypot_llm_message(list(recent_honeypot_events), now_iso)
+                            obj = call_llm_tcp(alert, args.llm_host, args.llm_port, args.llm_model, args.llm_timeout)
+                            if isinstance(obj, dict) and "error" not in obj:
+                                log_llm("honeypot_dos", obj)
+                        except Exception:
+                            pass
 
                 if args.isoforest:
                     obj = None
@@ -314,6 +510,15 @@ def main():
                             print(f"timestamp: {ts} anomaly detected len={int(features[0])} dt={features[1]:.3f}")
                             Path("honeypot_enabled").touch(exist_ok=True)
                             log_alert("honeypot_anomaly", f"anomaly detected len={int(features[0])} dt={features[1]:.3f}")
+                            if args.llm:
+                                try:
+                                    now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+                                    alert = honeypot_llm_message(list(recent_honeypot_events), now_iso)
+                                    obj3 = call_llm_tcp(alert, args.llm_host, args.llm_port, args.llm_model, args.llm_timeout)
+                                    if isinstance(obj3, dict) and "error" not in obj3:
+                                        log_llm("honeypot_anomaly", obj3)
+                                except Exception:
+                                    pass
 
                         
                     else:
@@ -339,6 +544,19 @@ def main():
         try:
             if http_log_handle:
                 http_log_handle.close()
+        except Exception:
+            pass
+        try:
+            net_stop.set()
+        except Exception:
+            pass
+        try:
+            if net_proc and net_proc.poll() is None:
+                net_proc.terminate()
+                try:
+                    net_proc.wait(timeout=2)
+                except Exception:
+                    pass
         except Exception:
             pass
 
