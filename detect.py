@@ -12,6 +12,7 @@ from scipy.stats import entropy
 from collections import Counter
 import socket
 import threading
+from signaturedetect import (SynFloodDetector, UdpFloodDetector, IcmpFloodDetector, RateFloodDetector)
 
 """
 This file has a combination of signature based detection and anomaly based detection.
@@ -20,7 +21,7 @@ Anomaly based detction using isolation forest, mainly just setup for testing pur
 """
 
 WINDOW = 10
-THRESHOLD = 10
+THRESHOLD = 10000000
 ALERTS_FILE = Path("alerts.log")
 LLM_ALERTS_FILE = Path("llm_alerts.log")
 
@@ -124,6 +125,45 @@ def honeypot_llm_message(objs, now_iso):
         "event_count": len(objs),
         "top_ips": [{"ip": ip, "count": c} for ip, c in top_ips],
         "top_ports": [{"port": p, "count": c} for p, c in top_ports],
+        "samples": samples[:10]
+    }
+
+
+
+# Prepares data for llm in specific format
+def network_llm_message(objs, now_iso):
+    samples = []
+    srcs = []
+    dst_ports = []
+    protos = []
+    flags = []
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        prot = obj.get("proto", "")
+        protos.append(prot)
+        srcs.append(obj.get("src_ip", ""))
+        dp = obj.get("dst_port", None)
+        if dp is not None:
+            dst_ports.append(dp)
+        tf = obj.get("tcp_flags", [])
+        if isinstance(tf, list) and tf:
+            flags.append(",".join(tf))
+        samples.append(json.dumps(obj)[:200])
+
+    top_srcs = Counter(srcs).most_common(5) if srcs else []
+    top_ports = Counter(dst_ports).most_common(5) if dst_ports else []
+    top_protocols = Counter(protos).most_common(5) if protos else []
+    top_flags = Counter(flags).most_common(5) if flags else []
+
+    return {
+        "timestamp": now_iso,
+        "source": "network",
+        "event_count": len(objs),
+        "top_src_ips": [{"ip": ip, "count": c} for ip, c in top_srcs],
+        "top_dst_ports": [{"port": p, "count": c} for p, c in top_ports],
+        "top_protocols": [{"proto": p, "count": c} for p, c in top_protocols],
+        "top_tcp_flags": [{"flags": f, "count": c} for f, c in top_flags],
         "samples": samples[:10]
     }
 
@@ -248,6 +288,20 @@ def _features_honeypot(obj, now, prev_timestamp, recent):
     return [line_length, float(dt), randomness, printable, rate, port], timestamp, data
 
 
+# Gets own ip
+def get_own_ip(iface):
+    try:
+        import fcntl
+        import struct
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return socket.inet_ntoa(fcntl.ioctl(
+            s.fileno(), 0x8915,
+            struct.pack('256s', iface[:15].encode())
+        )[20:24])
+    except Exception:
+        return None
+
+
 # Starts network capturing
 def start_network_cap(iface, out_path):
     try:
@@ -271,6 +325,16 @@ def network_monitor(out_path, args, stop_event):
             continue
         break
 
+    syn_detector = SynFloodDetector(window_sec=3.0, alpha=0.5, k=1.0, pad_ttl=30.0, consecutive_required=3)
+    udp_detector = UdpFloodDetector(window_sec=3.0, alpha=0.5, k=1.0, pad_ttl=30.0, consecutive_required=3)
+
+    icmp_detector = IcmpFloodDetector(window_sec=3.0, alpha=0.5, k=1.0, pad_ttl=30.0, consecutive_required=3)
+
+    local_ip = get_own_ip(args.net_iface)
+
+
+    rate_detector = RateFloodDetector( window_sec=3.0, alpha=0.5, a=0.1, consecutive_required=3, local_ip=local_ip)
+
     try:
         for line in read(p):
             if stop_event.is_set():
@@ -289,6 +353,185 @@ def network_monitor(out_path, args, stop_event):
                 continue
 
             recent_net_events.append(obj)
+
+            attack_alert = syn_detector.feed(obj)
+
+
+
+            if attack_alert:
+                ts = datetime.datetime.now().isoformat(timespec="seconds")
+                pad_size = len(syn_detector.pad)
+                msg = (
+                    f"SYN flood confirmed — "
+                    f"3 consecutive windows, "
+                    f"PAD size={pad_size}"
+                )
+                log_alert("syn_flood", msg)
+                Path("honeypot_enabled").touch(exist_ok=True)
+
+                if args.llm:
+                    try:
+                        now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+                        alert = network_llm_message(list(recent_net_events), now_iso)
+                        alert["syn_flood_meta"] = {
+                            "pkt_mean": round(syn_detector._pkt_mean, 2),
+                            "pkt_std": round(syn_detector._pkt_std, 2),
+                            "pkt_threshold": round(syn_detector._pkt_threshold, 2),
+                            "pr_mean": round(syn_detector._pr_mean, 2),
+                            "pr_std": round(syn_detector._pr_std, 2),
+                            "pr_threshold": round(syn_detector._pr_threshold, 2),
+                            "pad_size": pad_size
+                        }
+                        llm_obj = call_llm_tcp(
+                            alert,
+                            args.llm_host,
+                            args.llm_port,
+                            args.llm_model,
+                            args.llm_timeout
+                        )
+                        if isinstance(llm_obj, dict) and "error" not in llm_obj:
+                            log_llm("syn_flood", llm_obj)
+                    except Exception:
+                        pass
+
+                syn_detector.reset_attack()
+
+            elif syn_detector.phase1_warning:
+                ts = datetime.datetime.now().isoformat(timespec="seconds")\
+            
+
+            udp_alert = udp_detector.feed(obj)
+
+            if udp_alert:
+                
+                ts = datetime.datetime.now().isoformat(timespec="seconds")
+                pad_size = len(udp_detector.pad)
+                msg = (
+                    f"UDP flood confirmed — "
+                    f"3 consecutive windows, "
+                    f"PAD size={pad_size}"
+                )
+                log_alert("udp_flood", msg)
+                Path("honeypot_enabled").touch(exist_ok=True)
+
+
+                if args.llm:
+                    try:
+                        now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+                        alert = network_llm_message(list(recent_net_events), now_iso)
+                        alert["udp_flood_meta"] = {
+                            "pkt_mean": round(udp_detector._pkt_mean, 2),
+                            "pkt_std": round(udp_detector._pkt_std, 2),
+                            "pkt_threshold": round(udp_detector._pkt_threshold, 2),
+                            "pr_mean": round(udp_detector._pr_mean, 2),
+                            "pr_std": round(udp_detector._pr_std, 2),
+                            "pr_threshold": round(udp_detector._pr_threshold, 2),
+                            "pad_size": pad_size
+                        }
+                        llm_obj = call_llm_tcp(
+                            alert,
+                            args.llm_host,
+                            args.llm_port,
+                            args.llm_model,
+                            args.llm_timeout
+                        )
+                        if isinstance(llm_obj, dict) and "error" not in llm_obj:
+                            log_llm("udp_flood", llm_obj)
+                    except Exception:
+                        pass
+
+                udp_detector.reset_attack()
+
+            elif udp_detector.phase1_warning:
+                ts = datetime.datetime.now().isoformat(timespec="seconds")
+
+            icmp_alert = icmp_detector.feed(obj)
+
+            if icmp_alert:
+                ts = datetime.datetime.now().isoformat(timespec="seconds")
+                pad_size = len(icmp_detector.pad)
+                msg = (
+                    f"ICMP flood confirmed — "
+                    f"3 consecutive windows, "
+                    f"PAD size={pad_size}"
+                )
+
+                log_alert("icmp_flood", msg)
+                Path("honeypot_enabled").touch(exist_ok=True)
+
+                if args.llm:
+                    try:
+                        now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+                        alert = network_llm_message(list(recent_net_events), now_iso)
+                        alert["icmp_flood_meta"] = {
+                            "pkt_mean": round(icmp_detector._pkt_mean, 2),
+                            "pkt_std": round(icmp_detector._pkt_std, 2),
+                            "pkt_threshold": round(icmp_detector._pkt_threshold, 2),
+                            "pr_mean": round(icmp_detector._pr_mean, 2),
+                            "pr_std": round(icmp_detector._pr_std, 2),
+                            "pr_threshold": round(icmp_detector._pr_threshold, 2),
+                            "pad_size": pad_size
+                        }
+                        llm_obj = call_llm_tcp(
+                            alert,
+                            args.llm_host,
+                            args.llm_port,
+                            args.llm_model,
+                            args.llm_timeout
+                        )
+                        if isinstance(llm_obj, dict) and "error" not in llm_obj:
+                            log_llm("icmp_flood", llm_obj)
+                    except Exception:
+                        pass
+
+                icmp_detector.reset_attack()
+
+            elif icmp_detector.phase1_warning:
+                ts = datetime.datetime.now().isoformat(timespec="seconds")
+            rate_alert = rate_detector.feed(obj)
+
+
+            if rate_alert:
+                ts = datetime.datetime.now().isoformat(timespec="seconds")
+                ips = rate_detector.attacking_ips
+                msg = (
+                    f"rate flood confirmed — "
+                    f"attacking IPs: {ips}"
+                )
+                log_alert("rate_flood", msg)
+                Path("honeypot_enabled").touch(exist_ok=True)
+
+                if args.llm:
+                    try:
+                        now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+
+
+                        alert = network_llm_message(list(recent_net_events), now_iso)
+                        alert["rate_flood_meta"] = {
+                            "total_mean": round(rate_detector._total_mean, 2),
+                            "total_std": round(rate_detector._total_std, 2),
+                            "total_threshold": round(rate_detector._total_threshold, 2),
+                            "attacking_ips": ips
+                        }
+
+                        llm_obj = call_llm_tcp(
+                            alert,
+                            args.llm_host,
+                            args.llm_port,
+                            args.llm_model,
+                            args.llm_timeout
+                        )
+                        if isinstance(llm_obj, dict) and "error" not in llm_obj:
+                            log_llm("rate_flood", llm_obj)
+                    except Exception:
+                        pass
+
+                rate_detector.reset_attack()
+
+            elif rate_detector.phase1_warning:
+                ts = datetime.datetime.now().isoformat(timespec="seconds")
+
+
     except Exception:
         pass
 
@@ -305,7 +548,7 @@ def main():
     ap.add_argument("--llm-model", type=str, default=os.getenv("LLM_MODEL","llama3.1:8b"))
     ap.add_argument("--llm-timeout", type=int, default=int(os.getenv("LLM_TIMEOUT","60")))
     ap.add_argument("--net", action="store_true")
-    ap.add_argument("--net-iface", type=str, default=os.getenv("NET_IFACE","eth0"))
+    ap.add_argument("--net-iface", type=str, default=os.getenv("NET_IFACE","enp0s3"))
     ap.add_argument("--net-out", type=str, default=os.getenv("NET_OUT","network_logs.log"))
     args = ap.parse_args()
 
