@@ -383,4 +383,25 @@ class RateFloodDetector:
 
 
 
+# XMAS scan detection - just checks fin psh urg flags in tcp packet
+class XmasScanDetector:
+    def __init__(self):
+        self.triggered = False
+        
+
+    def process(self, obj):
+        if obj.get("proto") != "tcp":
+            return False
+        flags = obj.get("tcp_flags", [])
+        if "FIN" in flags and "PSH" in flags and "URG" in flags:
+            self.triggered = True
+            return True
+        return False
+
+
+    def reset_attack(self):
+        self.triggered = False
+
+
+
 
