@@ -13,6 +13,7 @@ from collections import Counter
 import socket
 import threading
 from signaturedetect import (SynFloodDetector, UdpFloodDetector, IcmpFloodDetector, RateFloodDetector)
+from ips import IPSBlocking
 
 """
 This file has a combination of signature based detection and anomaly based detection.
@@ -234,6 +235,15 @@ def _printable(s:str):
             count += 1
     return float(count) / float(len(s))
 
+
+def _extract_http_ip(line):
+    try:
+        ip = line.strip().split()[0]
+        socket.inet_aton(ip)
+        return ip
+    except Exception:
+        return None
+
 #features from the baseline for before honeypot activates
 def _features_baseline(line, now, prev_timestamp, recent):
     if prev_timestamp is None:
@@ -315,7 +325,7 @@ def start_network_cap(iface, out_path):
 
 
 # Monitors the network
-def network_monitor(out_path, args, stop_event):
+def network_monitor(out_path, args, stop_event, ips_blocking=None):
     p = Path(out_path)
     recent_net_events = deque(maxlen=400)
 
@@ -354,7 +364,7 @@ def network_monitor(out_path, args, stop_event):
 
             recent_net_events.append(obj)
 
-            attack_alert = syn_detector.feed(obj)
+            attack_alert = syn_detector.process(obj)
 
 
 
@@ -394,13 +404,16 @@ def network_monitor(out_path, args, stop_event):
                     except Exception:
                         pass
 
+                if ips_blocking:
+                    for ip in syn_detector.attacking_ips:
+                        ips_blocking.block_ip(ip)
                 syn_detector.reset_attack()
 
             elif syn_detector.phase1_warning:
                 ts = datetime.datetime.now().isoformat(timespec="seconds")\
             
 
-            udp_alert = udp_detector.feed(obj)
+            udp_alert = udp_detector.process(obj)
 
             if udp_alert:
                 
@@ -440,12 +453,15 @@ def network_monitor(out_path, args, stop_event):
                     except Exception:
                         pass
 
+                if ips_blocking:
+                    for ip in udp_detector.attacking_ips:
+                        ips_blocking.block_ip(ip)
                 udp_detector.reset_attack()
 
             elif udp_detector.phase1_warning:
                 ts = datetime.datetime.now().isoformat(timespec="seconds")
 
-            icmp_alert = icmp_detector.feed(obj)
+            icmp_alert = icmp_detector.process(obj)
 
             if icmp_alert:
                 ts = datetime.datetime.now().isoformat(timespec="seconds")
@@ -484,11 +500,14 @@ def network_monitor(out_path, args, stop_event):
                     except Exception:
                         pass
 
+                if ips_blocking:
+                    for ip in icmp_detector.attacking_ips:
+                        ips_blocking.block_ip(ip)
                 icmp_detector.reset_attack()
 
             elif icmp_detector.phase1_warning:
                 ts = datetime.datetime.now().isoformat(timespec="seconds")
-            rate_alert = rate_detector.feed(obj)
+            rate_alert = rate_detector.process(obj)
 
 
             if rate_alert:
@@ -526,6 +545,9 @@ def network_monitor(out_path, args, stop_event):
                     except Exception:
                         pass
 
+                if ips_blocking:
+                    for ip in rate_detector.attacking_ips:
+                        ips_blocking.block_ip(ip)
                 rate_detector.reset_attack()
 
             elif rate_detector.phase1_warning:
@@ -550,11 +572,26 @@ def main():
     ap.add_argument("--net", action="store_true")
     ap.add_argument("--net-iface", type=str, default=os.getenv("NET_IFACE","enp0s3"))
     ap.add_argument("--net-out", type=str, default=os.getenv("NET_OUT","network_logs.log"))
+    ap.add_argument("--ips", action="store_true")
+    ap.add_argument("--ips-duration", type=int, default=300)
+    ap.add_argument("--ips-whitelist", type=str, default="")
     args = ap.parse_args()
 
     logs_dir = Path("honeypot_logs")
     logs_dir.mkdir(exist_ok=True)
     print(f"dir: {logs_dir} window:{WINDOW}s threshold: {THRESHOLD}")
+
+    ips_blocking = IPSBlocking(duration=args.ips_duration) if args.ips else None
+    if ips_blocking:
+        local_ip = get_own_ip(args.net_iface)
+        if local_ip:
+            ips_blocking.add_whitelist(local_ip)
+        if args.ips_whitelist:
+            for _wip in args.ips_whitelist.split(","):
+                _wip = _wip.strip()
+                if _wip:
+                    ips_blocking.add_whitelist(_wip)
+
     recent = deque()
     model = None
     baseline = []
@@ -582,7 +619,7 @@ def main():
     net_thread = None
     if args.net:
         net_proc = start_network_cap(args.net_iface, args.net_out)
-        net_thread = threading.Thread(target=network_monitor, args=(args.net_out, args, net_stop))
+        net_thread = threading.Thread(target=network_monitor, args=(args.net_out, args, net_stop, ips_blocking))
         net_thread.daemon = True
 
         net_thread.start()
@@ -639,6 +676,13 @@ def main():
                 print(f"timestamp: {ts} {len(recent)} events in last {WINDOW} seconds")
                 Path("honeypot_enabled").touch(exist_ok=True)
                 log_alert("baseline_dos", f"{len(recent)} events in last {WINDOW} seconds")
+                if ips_blocking:
+                    seen = set()
+                    for bl in recent_baseline_events:
+                        ip = _extract_http_ip(str(bl))
+                        if ip and ip not in seen:
+                            ips_blocking.block_ip(ip)
+                            seen.add(ip)
                 if args.llm:
                     try:
                         now_iso = datetime.datetime.now().isoformat(timespec="seconds")
@@ -669,6 +713,10 @@ def main():
                         print(f"timestamp: {ts} anomaly detected len={int(features[0])} dt={features[1]:.3f}")
                         Path("honeypot_enabled").touch(exist_ok=True)
                         log_alert("baseline_anomaly", f"anomaly detected len={int(features[0])} dt={features[1]:.3f}")
+                        if ips_blocking:
+                            ip = _extract_http_ip(line)
+                            if ip:
+                                ips_blocking.block_ip(ip)
                         if args.llm:
                             try:
                                 now_iso = datetime.datetime.now().isoformat(timespec="seconds")
@@ -722,6 +770,13 @@ def main():
                     print(f"timestamp: {ts} {len(recent)} events in last {WINDOW} seconds")
                     Path("honeypot_enabled").touch(exist_ok=True)
                     log_alert("honeypot_dos", f"{len(recent)} events in last {WINDOW} seconds")
+                    if ips_blocking:
+                        seen = set()
+                        for _he in recent_honeypot_events:
+                            _ip = _he.get("remote_ip", "") if isinstance(_he, dict) else ""
+                            if _ip and _ip not in seen:
+                                ips_blocking.block_ip(_ip)
+                                seen.add(_ip)
                     if args.llm:
                         try:
                             now_iso = datetime.datetime.now().isoformat(timespec="seconds")
@@ -753,6 +808,10 @@ def main():
                             print(f"timestamp: {ts} anomaly detected len={int(features[0])} dt={features[1]:.3f}")
                             Path("honeypot_enabled").touch(exist_ok=True)
                             log_alert("honeypot_anomaly", f"anomaly detected len={int(features[0])} dt={features[1]:.3f}")
+                            if ips_blocking:
+                                _ip = obj.get("remote_ip", "") if isinstance(obj, dict) else ""
+                                if _ip:
+                                    ips_blocking.block_ip(_ip)
                             if args.llm:
                                 try:
                                     now_iso = datetime.datetime.now().isoformat(timespec="seconds")

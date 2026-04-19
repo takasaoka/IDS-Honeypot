@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 import sys
 import json
+import datetime
 from collections import deque
 
 """
@@ -24,6 +25,13 @@ LLM_HOST = '192.168.1.71'
 LLM_PORT = '5555'
 LLM_MODEL = 'qwen2.5:3b'
 LLM_TIMEOUT = '60'
+
+IPS_ENABLED = True
+IPS_DURATION = '300'
+IPS_WHITELIST = ''
+
+NET_IFACE = 'enp0s3'
+NET_OUT = 'network_logs.log'
 
 
 # Loads the honeypot logs
@@ -163,6 +171,48 @@ def load_llm_logs():
     return rows
 
 
+def load_blocked_logs():
+    rows = []
+    p = Path('blocked.log')
+    if not p.exists():
+        return rows
+    blocked = {}
+    try:
+        with p.open('r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    ip = obj.get('ip', '')
+                    action = obj.get('action', '')
+                    if action == 'block':
+                        blocked[ip] = obj.get('timestamp', '')
+                    elif action == 'unblock':
+                        blocked.pop(ip, None)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    for ip, ts in blocked.items():
+        rows.append({'ip': ip, 'timestamp': ts})
+    return rows
+
+
+def unblock_ip_dashboard(ip):
+    try:
+        subprocess.run(
+            ['iptables', '-D', 'INPUT', '-s', ip, '-j', 'DROP'],
+            check=True, capture_output=True
+        )
+        ts = datetime.datetime.now().isoformat(timespec='seconds')
+        with Path('blocked.log').open('a') as f:
+            f.write(json.dumps({'timestamp': ts, 'ip': ip, 'action': 'unblock'}) + '\n')
+    except Exception:
+        pass
+
+
 
 
 # starts IDS
@@ -175,8 +225,13 @@ def start_ids():
     
     try:
         detect_log_handle = Path('detect_process.log').open('a', buffering=1)
+        cmd = [sys.executable, '-u', 'detect.py', '--net', '--isoforest', '--baseline', '1000', '--contamination', '0.015', '--llm', '--llm-host', LLM_HOST, '--llm-port', LLM_PORT, '--llm-model', LLM_MODEL, '--llm-timeout', LLM_TIMEOUT, '--net-iface', NET_IFACE, '--net-out', NET_OUT]
+        if IPS_ENABLED:
+            cmd += ['--ips', '--ips-duration', IPS_DURATION]
+            if IPS_WHITELIST:
+                cmd += ['--ips-whitelist', IPS_WHITELIST]
         detect_process = subprocess.Popen(
-            [sys.executable, '-u', 'detect.py', '--net', '--isoforest', '--baseline', '1000', '--contamination', '0.015', '--llm', '--llm-host', LLM_HOST, '--llm-port', LLM_PORT, '--llm-model', LLM_MODEL, '--llm-timeout', LLM_TIMEOUT],
+            cmd,
             stdout=detect_log_handle,
             stderr=subprocess.STDOUT,
         )
@@ -364,10 +419,40 @@ with ui.column().classes('w-full'):
         ui.button('Refresh honeypot logs', on_click=lambda: honeypot_table.update_rows(load_honeypot_logs()))
 
 
+blocked_columns = [
+    {'name': 'timestamp', 'label': 'Blocked At', 'field': 'timestamp', 'sortable': True},
+    {'name': 'ip', 'label': 'IP Address', 'field': 'ip', 'sortable': True},
+    {'name': 'unblock', 'label': 'Action', 'field': 'unblock', 'sortable': False},
+]
+
+
+def handle_unblock(e):
+    row = e.args
+    if not isinstance(row, dict):
+        return
+    ip = row.get('ip', '')
+    if ip:
+        unblock_ip_dashboard(ip)
+        blocked_table.update_rows(load_blocked_logs())
+
+
+with ui.column().classes('w-full'):
+    ui.label('Blocked IPs')
+    blocked_table = ui.table(columns=blocked_columns, rows=load_blocked_logs(), pagination=10).classes('w-full')
+    blocked_table.add_slot('body-cell-unblock', '''
+    <q-td :props="props">
+    <q-btn label="Unblock" size="sm" color="negative" @click="$parent.$emit('unblock_ip', props.row)" />
+    </q-td>
+    ''')
+    blocked_table.on('unblock_ip', handle_unblock)
+    ui.button('Refresh blocked IPs', on_click=lambda: blocked_table.update_rows(load_blocked_logs()))
+
+
 def refresh():
     update_status()
     alerts_table.update_rows(load_alert_logs())
     llm_table.update_rows(load_llm_logs())
+    blocked_table.update_rows(load_blocked_logs())
 
 
 

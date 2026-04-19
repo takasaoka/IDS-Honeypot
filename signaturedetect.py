@@ -57,6 +57,9 @@ class PAD:
     def contains(self, ip: str):
         return ip in self._store
 
+    def __len__(self):
+        return len(self._store)
+
     def expire(self):
         cutoff = time.time() - self.ttl
         
@@ -96,6 +99,7 @@ class FloodDetector(ABC):
         self._window_start: float = time.time()
         self.attack_active: bool = False
         self.phase1_warning: bool = False
+        self.attacking_ips: list = []
 
 
 
@@ -120,7 +124,14 @@ class FloodDetector(ABC):
         now = time.time()
 
         if now - self._window_start >= self.window_sec:
-            return self._end_window(now)
+            result = self._end_window(now)
+            src_ip = obj.get("src_ip", "")
+            if self._correct_packet(obj):
+                self._pkt_count += 1
+                self._tad.add(src_ip)
+            flow = self._flow_key(obj)
+            self._flow_packets[flow] = self._flow_packets.get(flow, 0) + 1
+            return result
 
 
         src_ip = obj.get("src_ip", "")
@@ -189,6 +200,7 @@ class FloodDetector(ABC):
 
                 if self._consecutive_high_pr >= self.consecutive_required:
                     self.attack_active = True
+                    self.attacking_ips = list(unknown_ips)
                     confirmed = True
 
         self._pkt_count = 0
@@ -215,6 +227,7 @@ class FloodDetector(ABC):
         self.attack_active = False
         self.phase1_warning = False
         self._consecutive_high_pr = 0
+        self.attacking_ips = []
 
 
 
